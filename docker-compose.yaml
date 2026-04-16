@@ -1,0 +1,25 @@
+services:
+  pineconeadapter:
+    build: .
+    container_name: pineconeadapter
+    restart: unless-stopped
+    expose:
+      - $PORT
+# uncomment to listen on this port on docker-host
+#    port:
+#      - ${PORT}:${PORT}
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:${PORT}/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      retries: 3
+# remove the networks lines if you want the container without reverse proxy
+    networks:
+      - nginx-proxy-manager_nginx-proxy-network
+
+networks:
+  nginx-proxy-manager_nginx-proxy-network:
+    external: true
