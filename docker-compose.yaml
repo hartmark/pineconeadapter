@@ -15,7 +15,6 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      retries: 3
 # remove the networks lines if you want the container without reverse proxy
     networks:
       - nginx-proxy-manager_nginx-proxy-network
