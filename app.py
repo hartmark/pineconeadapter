@@ -27,8 +27,6 @@ logging.getLogger("werkzeug").addFilter(FilterHealthOK())
 app = Flask(__name__)
 
 PINECONE_API_KEY = os.environ["PINECONE_API_KEY"]
-EMBED_MODEL      = os.environ.get("EMBED_MODEL", "llama-text-embed-v2")
-EMBED_DIMENSIONS = int(os.environ.get("EMBED_DIMENSIONS", "2048"))
 API_KEY          = os.environ.get("PINECONEADAPTER_API_KEY", "")
 PORT             = int(os.environ.get("PORT", 11434))
 
@@ -40,7 +38,7 @@ from pinecone import Pinecone
 from pinecone.exceptions import PineconeApiException
 
 pc = Pinecone(api_key=PINECONE_API_KEY)
-log.info(f"Pinecone client ready — model={EMBED_MODEL} dimensions={EMBED_DIMENSIONS}")
+log.info(f"Pinecone client ready")
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -133,7 +131,7 @@ Always include these when upserting:
         "OllamaEmbedRequest": {
             "type": "object",
             "properties": {
-                "model":  {"type": "string", "example": EMBED_MODEL},
+                "model":  {"type": "string", "example": "llama-text-embed-v2"},
                 "prompt": {"type": "string", "example": "What is the capital of France?"},
                 "input":  {"type": "string", "description": "Alternative to prompt. Can also be a JSON array for batch."},
             },
@@ -153,6 +151,10 @@ Always include these when upserting:
                     "type": "string",
                     "description": "Text or JSON array of texts to embed.",
                     "example": "Pinecone enables fast vector similarity search at scale",
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Pinecone model to use.",
                 },
             },
         },
@@ -188,6 +190,22 @@ Always include these when upserting:
                 },
             },
         },
+        "UpsertVectorRecord": {
+            "type": "object",
+            "required": ["id", "values"],
+            "properties": {
+                "id":     {"type": "string", "example": "doc-chunk-001"},
+                "values": {"type": "array", "items": {"type": "number"}, "example": [0.1, 0.2, 0.3]},
+                "text":   {"type": "string", "example": "Optional text for metadata readability"},
+                "metadata": {
+                    "type": "object",
+                    "example": {
+                        "source": "documents",
+                        "filename": "pinecone-intro.md",
+                    },
+                },
+            },
+        },
         "UpsertRequest": {
             "type": "object",
             "required": ["index", "records"],
@@ -199,6 +217,23 @@ Always include these when upserting:
                     "description": "Separate data by type or tenant. Default: ''",
                 },
                 "records": {"type": "array", "items": {"$ref": "#/definitions/UpsertRecord"}},
+                "model": {
+                    "type": "string",
+                    "description": "Pinecone model to use.",
+                },
+            },
+        },
+        "UpsertVectorRequest": {
+            "type": "object",
+            "required": ["index", "records"],
+            "properties": {
+                "index": {"type": "string", "example": "my-index"},
+                "namespace": {
+                    "type": "string",
+                    "example": "documents",
+                    "description": "Separate data by type or tenant. Default: ''",
+                },
+                "records": {"type": "array", "items": {"$ref": "#/definitions/UpsertVectorRecord"}},
             },
         },
         "UpsertResponse": {
@@ -216,13 +251,22 @@ Always include these when upserting:
         },
         "SearchRequest": {
             "type": "object",
-            "required": ["index", "query"],
+            "required": ["index"],
             "properties": {
                 "index": {"type": "string", "example": "my-index"},
                 "query": {
                     "type": "string",
                     "example": "How does vector search work?",
                     "description": "Natural language search query. The API embeds it for you.",
+                },
+                "vector": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "Pre-embedded vector to search with. Alternative to 'query'.",
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Pinecone model to use for query embedding (if 'query' is natural language).",
                 },
                 "namespace": {
                     "type": "string",
@@ -246,6 +290,10 @@ Always include these when upserting:
                     "example": {"source": {"$eq": "documents"}},
                     "description": "Pinecone metadata filter. See Pinecone filter docs.",
                 },
+                "model": {
+                    "type": "string",
+                    "description": "Pinecone model to use.",
+                }
             },
         },
         "SearchMatch": {
@@ -330,14 +378,46 @@ def sanitize(text: str) -> str:
     return text.encode("utf-8", errors="replace").decode("utf-8")
 
 
-def _embed_with_retry(inputs: list[str], input_type: str) -> list[list[float]]:
+def get_model_dimensions(model_name: str) -> int:
+    """Get dimensions for a model using Pinecone Inference API with local caching."""
+    if not hasattr(get_model_dimensions, "_cache"):
+        get_model_dimensions._cache = {}
+
+    if model_name in get_model_dimensions._cache:
+        return get_model_dimensions._cache[model_name]
+
+    try:
+        model_info = pc.inference.get_model(model_name)
+        # Handle cases where dimension might be in different fields
+        dims = getattr(model_info, "dimension", None)
+        if dims is None and hasattr(model_info, "supported_dimensions"):
+            # If multiple are supported, we might need a default or just pick one.
+            # Usually for models like llama-text-embed-v2 it returns 1024.
+            dims = model_info.supported_dimensions[0] if model_info.supported_dimensions else 1024
+        
+        dims = dims or 1024
+        get_model_dimensions._cache[model_name] = dims
+        return dims
+    except Exception as e:
+        log.warning(f"Could not get dimensions for {model_name} from Pinecone: {e}. Falling back to 1024.")
+        return 1024
+
+
+def _embed_with_retry(inputs: list[str], input_type: str, model: str, dimensions: int = None) -> list[list[float]]:
+    if dimensions is None:
+        dimensions = get_model_dimensions(model)
+
+    params = {"input_type": input_type, "truncate": "END"}
+    if model != "multilingual-e5-large":
+        params["dimension"] = dimensions
+
     """Call Pinecone embed with exponential backoff on 429."""
     for attempt in range(MAX_RETRIES):
         try:
             result = pc.inference.embed(
-                model=EMBED_MODEL,
+                model=model,
                 inputs=inputs,
-                parameters={"input_type": input_type, "truncate": "END", "dimension": EMBED_DIMENSIONS},
+                parameters=params,
             )
             return [item["values"] for item in result.data]
         except PineconeApiException as e:
@@ -350,14 +430,14 @@ def _embed_with_retry(inputs: list[str], input_type: str) -> list[list[float]]:
     raise RuntimeError("Max retries exceeded")
 
 
-def do_embed(inputs: list[str]) -> list[list[float]]:
+def do_embed(inputs: list[str], model: str, dimensions: int = None) -> list[list[float]]:
     inputs = [sanitize(t) for t in inputs]
-    return _embed_with_retry(inputs, "passage")
+    return _embed_with_retry(inputs, "passage", model, dimensions)
 
 
-def do_embed_query(query: str) -> list[float]:
+def do_embed_query(query: str, model: str, dimensions: int = None) -> list[float]:
     """Embed a single search query (input_type=query for asymmetric models)."""
-    return _embed_with_retry([sanitize(query)], "query")[0]
+    return _embed_with_retry([sanitize(query)], "query", model, dimensions)[0]
 
 
 # ── System ────────────────────────────────────────────────────────────────────
@@ -381,13 +461,22 @@ def health():
       503:
         description: Pinecone unreachable or API key invalid
     """
+    model = request.args.get("model") or "llama-text-embed-v2"
+    dimensions = get_model_dimensions(model)
+
+    params = {"input_type": "passage", "truncate": "END"}
+    if model != "multilingual-e5-large":
+        params["dimension"] = dimensions
+
     try:
         pc.inference.embed(
-            model=EMBED_MODEL,
+            model=model,
             inputs=["health check"],
-            parameters={"input_type": "passage", "truncate": "END", "dimension": EMBED_DIMENSIONS},
+            parameters=params,
         )
-        return jsonify({"status": "ok", "model": EMBED_MODEL, "dimensions": EMBED_DIMENSIONS})
+        # Verify connectivity to control plane too
+        pc.list_indexes()
+        return jsonify({"status": "ok", "model": model, "dimensions": dimensions})
     except Exception as e:
         log.error(f"Health check failed: {e}")
         return jsonify({"status": "error", "detail": str(e)}), 503
@@ -419,7 +508,10 @@ def api_tags():
         description: Unauthorized
     """
     return jsonify({
-        "models": [{"name": EMBED_MODEL, "model": EMBED_MODEL, "details": {"family": "pinecone-inference"}}]
+        "models": [
+            {"name": "llama-text-embed-v2", "model": "llama-text-embed-v2", "details": {"family": "pinecone-inference"}},
+            {"name": "multilingual-e5-large-index", "model": "multilingual-e5-large-index", "details": {"family": "pinecone-inference"}},
+        ]
     })
 
 
@@ -462,9 +554,18 @@ def api_embeddings():
     if not raw:
         return jsonify({"error": "Missing 'prompt' or 'input'"}), 400
 
+    model = body.get("model")
+    if not model:
+        return jsonify({"error": "Missing 'model'"}), 400
+
     is_batch = isinstance(raw, list)
     inputs   = raw if is_batch else [raw]
-    vectors  = do_embed(inputs)
+
+    try:
+        vectors = do_embed(inputs, model)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
     log.info(f"Got {len(vectors)} vector(s) — dim={len(vectors[0])}")
 
     return jsonify({"embeddings": vectors} if is_batch else {"embedding": vectors[0]})
@@ -501,9 +602,15 @@ def v1_models():
         "object": "list",
         "data": [
             {
-                "id":       EMBED_MODEL,
+                "id":       "llama-text-embed-v2",
                 "object":   "model",
                 "created":  1744000000,
+                "owned_by": "pinecone",
+            },
+            {
+                "id": "bilingual-e5-large-index",
+                "object": "model",
+                "created": 1744000000,
                 "owned_by": "pinecone",
             }
         ],
@@ -569,9 +676,16 @@ def v1_embeddings():
     if not raw:
         return jsonify({"error": {"message": "Missing 'input'", "type": "invalid_request_error"}}), 400
 
+    model = body.get("model")
+    if not model:
+        return jsonify({"error": {"message": "Missing 'model'", "type": "invalid_request_error"}}), 400
+
     is_batch = isinstance(raw, list)
     inputs   = raw if is_batch else [raw]
-    vectors  = do_embed(inputs)
+    try:
+        vectors = do_embed(inputs, model)
+    except ValueError as e:
+        return jsonify({"error": {"message": str(e), "type": "invalid_request_error"}}), 400
 
     log.info(f"[v1/embeddings] {len(vectors)} vector(s) — dim={len(vectors[0])}")
 
@@ -579,7 +693,7 @@ def v1_embeddings():
 
     return jsonify({
         "object": "list",
-        "model":  EMBED_MODEL,
+        "model":  model,
         "data": [
             {
                 "object":    "embedding",
@@ -674,16 +788,23 @@ def api_embed():
 
     is_batch = isinstance(raw, list)
     inputs   = raw if is_batch else [raw]
+    model = body.get("model")
+    if not model:
+        return jsonify({"error": {"message": "Missing 'model'", "type": "invalid_request_error"}}), 400
 
     log.info(f"[api/embed] {len(inputs)} input(s)")
-    vectors = do_embed(inputs)
+    try:
+        vectors = do_embed(inputs, model)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
     log.info(f"[api/embed] Got {len(vectors)} vector(s) — dim={len(vectors[0])}")
 
     return jsonify({
         "embeddings": vectors,
         "count": len(vectors),
         "dimensions": len(vectors[0]),
-        "model": EMBED_MODEL,
+        "model": model,
     })
 
 
@@ -750,7 +871,15 @@ def api_upsert():
 
     now     = datetime.now(timezone.utc).isoformat()
     texts   = [r["text"] for r in records]
-    vectors = do_embed(texts)
+    model = body.get("model")
+
+    if not model:
+        return jsonify({"error": "Missing 'model'"}), 400
+
+    try:
+        vectors = do_embed(texts, model)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
 
     upsert_vectors = [
         {
@@ -772,12 +901,92 @@ def api_upsert():
     return jsonify({"upserted": len(upsert_vectors), "index": index_name, "namespace": namespace})
 
 
+@app.post("/api/upsert-vectors")
+@require_api_key
+def api_upsert_vectors():
+    """
+    Upsert pre-embedded vectors into a named Pinecone index.
+    Skips the embedding step. Useful when you have vectors from an external source.
+
+    **Example record:**
+    ```json
+    {
+      "id": "doc-001",
+      "values": [0.1, 0.2, 0.3, ...],
+      "text": "The original text (optional, for metadata)",
+      "metadata": { "source": "external" }
+    }
+    ```
+    ---
+    tags: [ping]
+    security:
+      - BearerAuth: []
+      - ApiKeyAuth: []
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/UpsertVectorRequest'
+    responses:
+      200:
+        description: Upsert result
+        schema:
+          $ref: '#/definitions/UpsertResponse'
+      400:
+        description: Missing or invalid fields
+      401:
+        description: Unauthorized
+      404:
+        description: Index not found
+    """
+    body       = request.get_json(force=True)
+    index_name = body.get("index")
+    records    = body.get("records")
+    namespace  = body.get("namespace", "")
+
+    if not index_name or not records:
+        return jsonify({"error": "Missing 'index' or 'records'"}), 400
+
+    if not isinstance(records, list) or not all("id" in r and "values" in r for r in records):
+        return jsonify({"error": "Each record must have 'id' and 'values'"}), 400
+
+    try:
+        idx = pc.Index(index_name)
+    except Exception as e:
+        return jsonify({"error": f"Could not connect to index '{index_name}': {e}"}), 404
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    upsert_vectors = []
+    for r in records:
+        metadata = {
+            "created_at": now,
+            **r.get("metadata", {}),
+        }
+        if "text" in r:
+            metadata["text"] = r["text"][:1000]
+
+        upsert_vectors.append({
+            "id": r["id"],
+            "values": r["values"],
+            "metadata": metadata,
+        })
+
+    log.info(f"[api/upsert-vectors] {len(upsert_vectors)} vectors → index={index_name} namespace={namespace!r}")
+    idx.upsert(vectors=upsert_vectors, namespace=namespace)
+    log.info(f"[api/upsert-vectors] Done")
+
+    return jsonify({"upserted": len(upsert_vectors), "index": index_name, "namespace": namespace})
+
+
 @app.post("/api/search")
 @require_api_key
 def api_search():
     """
     Semantic search in a Pinecone index.
     The API embeds your query automatically — just pass natural language.
+    Alternatively, pass a pre-embedded `vector`.
 
     **Example queries:**
     - `"What is Pinecone used for?"`
@@ -809,7 +1018,7 @@ def api_search():
         schema:
           $ref: '#/definitions/SearchResponse'
       400:
-        description: Missing index or query
+        description: Missing index, query/vector, model
       401:
         description: Unauthorized
       404:
@@ -818,22 +1027,35 @@ def api_search():
     body       = request.get_json(force=True)
     index_name = body.get("index")
     query      = body.get("query")
+    vector     = body.get("vector")
     namespace  = body.get("namespace", "")
     top_k      = min(int(body.get("top_k", 5)), 20)
     min_score  = float(body.get("min_score", 0.0))
     filter_    = body.get("filter", None)
+    model      = body.get("model")
 
-    if not index_name or not query:
-        return jsonify({"error": "Missing 'index' or 'query'"}), 400
+    if not index_name:
+        return jsonify({"error": "Missing 'index'"}), 400
+
+    if not query and not vector:
+        return jsonify({"error": "Missing 'query' or 'vector'"}), 400
 
     try:
         idx = pc.Index(index_name)
     except Exception as e:
         return jsonify({"error": f"Could not connect to index '{index_name}': {e}"}), 404
 
-    log.info(f"[api/search] query={query[:100]!r} index={index_name} namespace={namespace!r} top_k={top_k}")
-
-    query_vector = do_embed_query(query)
+    if vector:
+        query_vector = vector
+        log.info(f"[api/search] vector search index={index_name} namespace={namespace!r} top_k={top_k}")
+    else:
+        if not model:
+            return jsonify({"error": "Missing 'model' for text query"}), 400
+        log.info(f"[api/search] query={query[:100]!r} index={index_name} namespace={namespace!r} top_k={top_k}")
+        try:
+            query_vector = do_embed_query(query, model)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
 
     query_kwargs = dict(
         vector=query_vector,
@@ -944,15 +1166,19 @@ def api_index_create():
     """
     from pinecone import ServerlessSpec
 
-    body      = request.get_json(force=True)
+    body       = request.get_json(force=True)
     name      = body.get("name")
-    dimension = int(body.get("dimension", EMBED_DIMENSIONS))
+    dimension = body.get("dimension")
+    if dimension:
+        dimension = int(dimension)
     metric    = body.get("metric", "cosine")
     cloud     = body.get("cloud", "aws")
     region    = body.get("region", "us-east-1")
 
     if not name:
         return jsonify({"error": "Missing 'name'"}), 400
+    if not dimension:
+        return jsonify({"error": "Missing 'dimension'. Provide in body."}), 400
 
     try:
         pc.create_index(
@@ -1226,6 +1452,10 @@ def api_index_compare():
               type: number
               example: 0.3
               default: 0.0
+            model:
+              type: string
+              example: llama-text-embed-v2
+              description: "Embedding model to use for the query"
             filter:
               type: object
               description: "Pinecone metadata filter applied to all indexes"
@@ -1293,6 +1523,10 @@ def api_index_compare():
     top_k     = min(int(body.get("top_k", 5)), 20)
     min_score = float(body.get("min_score", 0.0))
     filter_   = body.get("filter", None)
+    model = body.get("model")
+
+    if not model:
+        return jsonify({"error": "Provide the embedding model."}), 400
 
     if not indexes or len(indexes) < 2:
         return jsonify({"error": "Provide at least 2 index names in 'indexes'"}), 400
@@ -1301,7 +1535,7 @@ def api_index_compare():
 
     log.info(f"[api/indexes/compare] query={query[:80]!r} indexes={indexes} namespace={namespace!r}")
 
-    query_vector = do_embed_query(query)
+    query_vector = do_embed_query(query, model)
 
     results = {}
     errors  = {}

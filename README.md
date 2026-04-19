@@ -36,9 +36,7 @@ The service starts on port `11434` (same as Ollama) by default.
 | Variable | Default | Description |
 |---|---|---|
 | `PINECONE_API_KEY` | required | Your Pinecone API key |
-| `PINECONEADAPTERAPI_KEY` | — | Bearer token for protecting endpoints. If unset, all endpoints are open. |
-| `EMBED_MODEL` | `llama-text-embed-v2` | Pinecone inference model to use |
-| `EMBED_DIMENSIONS` | `2048` | Embedding dimensions |
+| `PINECONEADAPTER_API_KEY` | — | Bearer token for protecting endpoints. If unset, all endpoints are open. |
 | `PORT` | `11434` | Port to listen on |
 
 ## Endpoints
@@ -54,7 +52,8 @@ The service starts on port `11434` (same as Ollama) by default.
 | `GET` | `/api/indexes` | List Pinecone indexes |
 | `POST` | `/api/embed` | Embed text (single or batch) |
 | `POST` | `/api/upsert` | Embed + upsert to index |
-| `POST` | `/api/search` | Semantic search |
+| `POST` | `/api/upsert-vectors` | Upsert pre-embedded vectors |
+| `POST` | `/api/search` | Semantic search (supports text or vectors) |
 | `POST` | `/api/delete` | Delete vectors by ID |
 | `POST` | `/api/delete-by-file` | Delete all vectors for a filename |
 | `POST` | `/api/indexes/create` | Create a new index |
@@ -107,6 +106,37 @@ print(response.data[0].embedding)
 ## Using with Ollama clients
 
 Any tool configured to use Ollama at `http://localhost:11434` will work without changes, including [OpenClaw](https://openclaw.dev) and other Ollama-compatible clients. Just set the embedding model to `llama-text-embed-v2`.
+
+## Development and Testing
+
+The project uses `pytest` for testing.
+
+### Running tests
+```bash
+# Run all tests using the provided script
+./test/run_tests.sh
+
+# To run system tests against real Pinecone
+PINECONE_INDEX=my-index ./test/run_tests.sh --system
+```
+
+Alternatively, you can run them manually:
+```bash
+# Create a virtual environment and install dependencies
+python3 -m venv venv
+./venv/bin/pip install -r requirements.txt pytest
+
+# Run all tests (system tests will be skipped if PINECONE_API_KEY is dummy)
+./venv/bin/pytest test
+```
+
+### System tests
+To run tests against the real Pinecone API, ensure your `.env` file has a valid `PINECONE_API_KEY`. 
+For `upsert` and `search` system tests, also provide a `PINECONE_INDEX` name:
+
+```bash
+PINECONE_INDEX=my-index ./venv/bin/pytest test/test_system.py
+```
 
 ## Related
 
