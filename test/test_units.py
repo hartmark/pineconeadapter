@@ -61,7 +61,7 @@ def test_get_model_dimensions_success(mock_get_model):
     
     dims = get_model_dimensions("test-model")
     assert dims == 768
-    mock_get_model.assert_called_with("test-model")
+    mock_get_model.assert_called_with(model_name="test-model")
 
 @patch("app.pc.inference.get_model")
 def test_get_model_dimensions_fallback(mock_get_model):
@@ -83,3 +83,57 @@ def test_embed_multilingual_e5_large_no_dimension(mock_get_dims, mock_embed):
     args, kwargs = mock_embed.call_args
     assert "dimension" not in kwargs["parameters"]
     assert kwargs["parameters"]["input_type"] == "passage"
+
+@patch("app.pc.Index")
+def test_api_upsert_vectors_dimension_mismatch(mock_index_class, client):
+    mock_idx = MagicMock()
+    mock_index_class.return_value = mock_idx
+    
+    # Simulate PineconeApiException for dimension mismatch
+    error_response = MagicMock()
+    error_response.status = 400
+    error_response.data = '{"code":3,"message":"Vector dimension 3 does not match the dimension of the index 10","details":[]}'
+    # The SDK uses http_resp.data for body
+    error_response.body = error_response.data
+    
+    error = PineconeApiException(http_resp=error_response)
+    mock_idx.upsert.side_effect = error
+    
+    headers = {"X-API-Key": "test-secret"}
+    payload = {
+        "index": "my-index",
+        "records": [{"id": "v1", "values": [0.1, 0.2, 0.3]}]
+    }
+    
+    with patch("app.API_KEY", "test-secret"):
+        response = client.post("/api/upsert-vectors", json=payload, headers=headers)
+    
+    assert response.status_code == 400
+    # Should be the clean message now
+    assert response.get_json()["error"] == "Vector dimension 3 does not match the dimension of the index 10"
+
+@patch("app.pc.Index")
+def test_api_upsert_vectors_hard_fault(mock_index_class, client):
+    mock_idx = MagicMock()
+    mock_index_class.return_value = mock_idx
+    
+    # Simulate PineconeApiException for a 500 error (hard fault)
+    error_response = MagicMock()
+    error_response.status = 500
+    error_response.data = '{"message":"Internal Server Error"}'
+    error_response.body = error_response.data
+    
+    error = PineconeApiException(http_resp=error_response)
+    mock_idx.upsert.side_effect = error
+    
+    headers = {"X-API-Key": "test-secret"}
+    payload = {
+        "index": "my-index",
+        "records": [{"id": "v1", "values": [0.1, 0.2, 0.3]}]
+    }
+    
+    with patch("app.API_KEY", "test-secret"):
+        response = client.post("/api/upsert-vectors", json=payload, headers=headers)
+    
+    assert response.status_code == 500
+    assert response.get_json()["error"] == "Internal Server Error"

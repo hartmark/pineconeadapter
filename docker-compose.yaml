@@ -4,9 +4,9 @@ services:
     container_name: pineconeadapter
     restart: unless-stopped
     expose:
-      - $PORT
+      - ${PORT}
 # uncomment to listen on this port on docker-host
-#    port:
+#    ports:
 #      - ${PORT}:${PORT}
     env_file:
       - .env

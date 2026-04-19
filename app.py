@@ -387,7 +387,7 @@ def get_model_dimensions(model_name: str) -> int:
         return get_model_dimensions._cache[model_name]
 
     try:
-        model_info = pc.inference.get_model(model_name)
+        model_info = pc.inference.get_model(model_name=model_name)
         # Handle cases where dimension might be in different fields
         dims = getattr(model_info, "dimension", None)
         if dims is None and hasattr(model_info, "supported_dimensions"):
@@ -401,6 +401,20 @@ def get_model_dimensions(model_name: str) -> int:
     except Exception as e:
         log.warning(f"Could not get dimensions for {model_name} from Pinecone: {e}. Falling back to 1024.")
         return 1024
+
+
+def format_pinecone_error(e: PineconeApiException) -> str:
+    """Extract a clean error message from PineconeApiException."""
+    try:
+        import json
+        if hasattr(e, "body") and e.body:
+            data = json.loads(e.body)
+            if "message" in data:
+                return data["message"]
+        # Fallback if body is not JSON or doesn't have "message"
+        return str(e)
+    except Exception:
+        return str(e)
 
 
 def _embed_with_retry(inputs: list[str], input_type: str, model: str, dimensions: int = None) -> list[list[float]]:
@@ -895,7 +909,16 @@ def api_upsert():
     ]
 
     log.info(f"[api/upsert] {len(upsert_vectors)} vectors → index={index_name} namespace={namespace!r}")
-    idx.upsert(vectors=upsert_vectors, namespace=namespace)
+    try:
+        idx.upsert(vectors=upsert_vectors, namespace=namespace)
+    except PineconeApiException as e:
+        log.error(f"Pinecone API error during upsert: {e}")
+        # Map 4xx errors to 400 Bad Request, others to 500
+        status_code = 400 if 400 <= e.status < 500 else 500
+        return jsonify({"error": format_pinecone_error(e)}), status_code
+    except Exception as e:
+        log.error(f"Unexpected error during upsert: {e}")
+        return jsonify({"error": str(e)}), 500
     log.info(f"[api/upsert] Done")
 
     return jsonify({"upserted": len(upsert_vectors), "index": index_name, "namespace": namespace})
@@ -974,7 +997,16 @@ def api_upsert_vectors():
         })
 
     log.info(f"[api/upsert-vectors] {len(upsert_vectors)} vectors → index={index_name} namespace={namespace!r}")
-    idx.upsert(vectors=upsert_vectors, namespace=namespace)
+    try:
+        idx.upsert(vectors=upsert_vectors, namespace=namespace)
+    except PineconeApiException as e:
+        log.error(f"Pinecone API error during upsert-vectors: {e}")
+        # Map 4xx errors to 400 Bad Request, others to 500
+        status_code = 400 if 400 <= e.status < 500 else 500
+        return jsonify({"error": format_pinecone_error(e)}), status_code
+    except Exception as e:
+        log.error(f"Unexpected error during upsert-vectors: {e}")
+        return jsonify({"error": str(e)}), 500
     log.info(f"[api/upsert-vectors] Done")
 
     return jsonify({"upserted": len(upsert_vectors), "index": index_name, "namespace": namespace})
@@ -1066,7 +1098,16 @@ def api_search():
     if filter_:
         query_kwargs["filter"] = filter_
 
-    result = idx.query(**query_kwargs)
+    try:
+        result = idx.query(**query_kwargs)
+    except PineconeApiException as e:
+        log.error(f"Pinecone API error during search: {e}")
+        # Map 4xx errors to 400 Bad Request, others to 500
+        status_code = 400 if 400 <= e.status < 500 else 500
+        return jsonify({"error": format_pinecone_error(e)}), status_code
+    except Exception as e:
+        log.error(f"Unexpected error during search: {e}")
+        return jsonify({"error": str(e)}), 500
 
     matches = [
         {
